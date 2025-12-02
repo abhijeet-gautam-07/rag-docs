@@ -1,17 +1,35 @@
 // lib/gemini.ts — robust geminiEmbed replacement (REST)
 export async function geminiEmbed(texts: string[], model = "gemini-embedding-001"): Promise<number[][]> {
-const API_KEY = process.env.GEMINI_API_KEY;
+  const API_KEY = process.env.GEMINI_API_KEY;
   if (!API_KEY) throw new Error("GEMINI_API_KEY not configured");
   if (!Array.isArray(texts) || texts.length === 0) return [];
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`;
+  // Use batchEmbedContents for multiple texts, embedContent for single text
+  const url = texts.length === 1
+    ? `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`
+    : `https://generativelanguage.googleapis.com/v1beta/models/${model}:batchEmbedContents`;
 
-  // Construct one request with content.parts = one part per text
-  const body = {
-    content: {
-      parts: texts.map((t) => ({ text: t })),
-    },
-  };
+  let body: any;
+  if (texts.length === 1) {
+    // Single content embedding
+    body = {
+      model,
+      content: {
+        parts: [{ text: texts[0] }],
+      },
+    };
+  } else {
+    // Batch embedding - model should be full path format: "models/model-name"
+    const modelPath = model.startsWith("models/") ? model : `models/${model}`;
+    body = {
+      requests: texts.map((text) => ({
+        model: modelPath,
+        content: {
+          parts: [{ text }],
+        },
+      })),
+    };
+  }
 
   const res = await fetch(url, {
     method: "POST",
@@ -32,55 +50,159 @@ const API_KEY = process.env.GEMINI_API_KEY;
     throw new Error(`Gemini embed returned non-JSON: ${txt}`);
   }
 
-  // Try common shapes:
-  // 1) j.embeddings -> array (each item maybe {embedding: [...] } or array)
-  if (Array.isArray(j.embeddings)) {
-    const out: number[][] = j.embeddings.map((it: any) => {
-      if (Array.isArray(it)) return it as number[];
-      if (Array.isArray(it.embedding)) return it.embedding;
-      if (Array.isArray(it.values)) return it.values;
-      return null as any;
-    }).filter(Boolean);
-    if (out.length === texts.length) return out;
-    // fallthrough to additional parsing if counts mismatch
-  }
+  const embeddings: number[][] = [];
+  const isNumberArray = (arr: any): arr is number[] =>
+    Array.isArray(arr) && arr.length > 0 && typeof arr[0] === "number";
 
-  // 2) j.data or j.result.embeddings etc.
-  const candidateArrays: number[][] = [];
-  const walkCollect = (o: any) => {
-    if (!o) return;
-    if (Array.isArray(o) && o.length > 0 && typeof o[0] === "number") {
-      candidateArrays.push(o as number[]);
-      return;
-    }
-    if (Array.isArray(o)) {
-      for (const x of o) walkCollect(x);
-    } else if (typeof o === "object") {
-      for (const k of Object.keys(o)) walkCollect(o[k]);
-    }
+  const normalizeEmbedding = (value: any): number[] | null => {
+    if (!value) return null;
+    if (isNumberArray(value)) return value;
+    if (typeof value !== "object") return null;
+
+    if (isNumberArray((value as any).embedding)) return (value as any).embedding;
+    if (isNumberArray((value as any).values)) return (value as any).values;
+    if (isNumberArray((value as any).vector)) return (value as any).vector;
+    if (isNumberArray((value as any).embedding?.values)) return (value as any).embedding.values;
+    if (isNumberArray((value as any).vector?.values)) return (value as any).vector.values;
+
+    return null;
   };
-  walkCollect(j);
 
-  // If we found candidate numeric arrays, try to group them into embeddings (may overcollect)
-  if (candidateArrays.length >= texts.length) {
-    // Heuristic: if we have exact multiple-of texts.length, try to slice; else return first N
-    // Prefer contiguous arrays that match expected dimension (if we can infer)
-    const dims = candidateArrays.map((a) => a.length);
-    // Return first 'texts.length' arrays
-    return candidateArrays.slice(0, texts.length);
+  const pushEmbedding = (value: any) => {
+    const vec = normalizeEmbedding(value);
+    if (vec) embeddings.push(vec);
+  };
+
+  // Handle batch response (batchEmbedContents)
+  if (Array.isArray(j.embeddings)) {
+    for (const it of j.embeddings) {
+      pushEmbedding(it);
+    }
+  }
+  // Handle single response (embedContent) - wrap in array for consistency
+  else if (j.embedding) {
+    pushEmbedding(j.embedding);
+  }
+  // Handle alternative response formats
+  else if (Array.isArray(j.result?.embeddings)) {
+    for (const it of j.result.embeddings) {
+      pushEmbedding(it);
+    }
+  } else if (Array.isArray(j.data)) {
+    for (const d of j.data) {
+      pushEmbedding(d);
+    }
   }
 
-  // Last fallback: check j.result.embeddings or j.data
-  if (Array.isArray(j.result?.embeddings)) {
-    const out: number[][] = j.result.embeddings.map((it: any) => it.embedding ?? it).filter(Boolean);
-    if (out.length === texts.length) return out;
-  }
-  if (Array.isArray(j.data)) {
-    const out: number[][] = j.data.map((d: any) => d.embedding ?? d).filter(Boolean);
-    if (out.length === texts.length) return out;
+  if (embeddings.length === texts.length) {
+    return embeddings;
   }
 
   // If still can't match counts — give a clear error including the returned JSON (truncated)
   const snippet = txt.length > 2000 ? txt.slice(0, 2000) + "...(truncated)" : txt;
-  throw new Error(`Unexpected Gemini embed response: expected ${texts.length} embeddings but could not parse them. Response: ${snippet}`);
+  // Fallback: walk the payload and collect numeric arrays if still missing
+  const found: number[][] = [];
+  const walk = (obj: any) => {
+    if (!obj) return;
+    const maybe = normalizeEmbedding(obj);
+    if (maybe) {
+      found.push(maybe);
+      return;
+    }
+    if (Array.isArray(obj)) {
+      for (const item of obj) walk(item);
+    } else if (typeof obj === "object") {
+      for (const key of Object.keys(obj)) {
+        walk(obj[key]);
+      }
+    }
+  };
+  walk(j);
+  if (found.length >= texts.length) {
+    return found.slice(0, texts.length);
+  }
+
+  throw new Error(`Unexpected Gemini embed response: expected ${texts.length} embeddings but got ${embeddings.length}. Response: ${snippet}`);
+}
+
+/**
+ * Generate text using Gemini
+ */
+export async function geminiGenerate(prompt: string, model = "gemini-1.5-flash"): Promise<string> {
+  const API_KEY = process.env.GEMINI_API_KEY;
+  if (!API_KEY) throw new Error("GEMINI_API_KEY not configured");
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+  const body = {
+    contents: [
+      {
+        parts: [{ text: prompt }],
+      },
+    ],
+  };
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-goog-api-key": API_KEY },
+    body: JSON.stringify(body),
+  });
+
+  const txt = await res.text().catch(() => "");
+
+  if (!res.ok) {
+    throw new Error(`Gemini generate failed ${res.status}: ${txt || "<empty response>"}`);
+  }
+
+  let j: any;
+  try {
+    j = JSON.parse(txt || "{}");
+  } catch {
+    throw new Error(`Gemini generate returned non-JSON: ${txt}`);
+  }
+
+  // Extract text from response
+  const candidates = j.candidates;
+  if (!Array.isArray(candidates) || candidates.length === 0) {
+    throw new Error(`Gemini generate returned no candidates. Response: ${txt}`);
+  }
+
+  const content = candidates[0]?.content;
+  if (!content || !Array.isArray(content.parts)) {
+    throw new Error(`Gemini generate returned invalid content structure. Response: ${txt}`);
+  }
+
+  const textParts = content.parts
+    .map((part: any) => part.text)
+    .filter((text: any) => typeof text === "string")
+    .join("");
+
+  return textParts || "";
+}
+
+/**
+ * List available Gemini models
+ */
+export async function listModels(): Promise<any> {
+  const API_KEY = process.env.GEMINI_API_KEY;
+  if (!API_KEY) throw new Error("GEMINI_API_KEY not configured");
+
+  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${API_KEY}`;
+
+  const res = await fetch(url, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+  });
+
+  const txt = await res.text().catch(() => "");
+
+  if (!res.ok) {
+    throw new Error(`Gemini listModels failed ${res.status}: ${txt || "<empty response>"}`);
+  }
+
+  try {
+    return JSON.parse(txt || "{}");
+  } catch {
+    throw new Error(`Gemini listModels returned non-JSON: ${txt}`);
+  }
 }

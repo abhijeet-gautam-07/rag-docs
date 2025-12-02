@@ -143,9 +143,34 @@ function assembleChunks(
 
 async function geminiEmbeddingsBatch(texts: string[], model = "gemini-embedding-001", maxRetries = 3) {
   if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY not configured");
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`;
-  const parts = texts.map((t) => ({ text: t }));
-  const body = { model, content: { parts } };
+  if (!Array.isArray(texts) || texts.length === 0) return [];
+
+  // Use batchEmbedContents for multiple texts, embedContent for single text
+  const url = texts.length === 1
+    ? `https://generativelanguage.googleapis.com/v1beta/models/${model}:embedContent`
+    : `https://generativelanguage.googleapis.com/v1beta/models/${model}:batchEmbedContents`;
+
+  let body: any;
+  if (texts.length === 1) {
+    // Single content embedding
+    body = {
+      model,
+      content: {
+        parts: [{ text: texts[0] }],
+      },
+    };
+  } else {
+    // Batch embedding - model should be full path format: "models/model-name"
+    const modelPath = model.startsWith("models/") ? model : `models/${model}`;
+    body = {
+      requests: texts.map((text) => ({
+        model: modelPath,
+        content: {
+          parts: [{ text }],
+        },
+      })),
+    };
+  }
 
   let attempt = 0;
   while (attempt < maxRetries) {
@@ -177,20 +202,51 @@ async function geminiEmbeddingsBatch(texts: string[], model = "gemini-embedding-
 
     const embeddings: number[][] = [];
 
+    // Handle batch response (batchEmbedContents)
     if (Array.isArray(j.embeddings)) {
       for (const it of j.embeddings) {
-        if (Array.isArray(it.embedding)) embeddings.push(it.embedding);
-        else if (Array.isArray(it)) embeddings.push(it);
-        else if (Array.isArray(it.vector)) embeddings.push(it.vector);
-        else if (Array.isArray(it.values)) embeddings.push(it.values);
+        if (Array.isArray(it.embedding)) {
+          embeddings.push(it.embedding);
+        } else if (Array.isArray(it)) {
+          embeddings.push(it);
+        } else if (Array.isArray(it.vector)) {
+          embeddings.push(it.vector);
+        } else if (Array.isArray(it.values)) {
+          embeddings.push(it.values);
+        }
       }
-    } else if (Array.isArray(j.result?.embeddings)) {
-      for (const it of j.result.embeddings) embeddings.push(it.embedding ?? it);
+    }
+    // Handle single response (embedContent)
+    else if (j.embedding && Array.isArray(j.embedding)) {
+      embeddings.push(j.embedding);
+    }
+    // Handle alternative response formats
+    else if (Array.isArray(j.result?.embeddings)) {
+      for (const it of j.result.embeddings) {
+        if (Array.isArray(it.embedding)) {
+          embeddings.push(it.embedding);
+        } else if (Array.isArray(it)) {
+          embeddings.push(it);
+        }
+      }
     } else if (Array.isArray(j.result)) {
-      for (const it of j.result) embeddings.push(it.embedding ?? it);
+      for (const it of j.result) {
+        if (Array.isArray(it.embedding)) {
+          embeddings.push(it.embedding);
+        } else if (Array.isArray(it)) {
+          embeddings.push(it);
+        }
+      }
     } else if (Array.isArray(j.data)) {
-      for (const d of j.data) embeddings.push(d.embedding ?? d);
+      for (const d of j.data) {
+        if (Array.isArray(d.embedding)) {
+          embeddings.push(d.embedding);
+        } else if (Array.isArray(d)) {
+          embeddings.push(d);
+        }
+      }
     } else {
+      // Fallback: try to find any numeric arrays in the response
       const found: number[][] = [];
       const walk = (o: any) => {
         if (!o || typeof o !== "object") return;

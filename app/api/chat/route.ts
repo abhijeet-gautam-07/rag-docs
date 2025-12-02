@@ -1,64 +1,158 @@
 // app/api/chat/route.ts
 import { NextResponse } from "next/server";
-import { geminiEmbed, geminiGenerate } from "@/lib/gemini";
+import { GoogleGenerativeAI, SchemaType } from "@google/generative-ai";
 import { pineconeQuery } from "@/lib/pinecone";
+import { geminiEmbed } from "@/lib/gemini";
+import { createClient } from "@supabase/supabase-js";
 
-type ReqBody = { message: string; topK?: number };
+export const maxDuration = 60;
 
-// Server-only route: receives { message } and returns assistant reply + context matches
+// --- Helper: Clean Filename ---
+function filenameToFriendlyName(path?: string | null): string {
+  if (!path) return "Unknown File";
+  const parts = String(path).split("/");
+  const file = parts[parts.length - 1] ?? path;
+  // Removes extension and typical ID prefixes
+  return file.replace(/\.[^/.]+$/, "").replace(/^[0-9-_]+_/, "").replace(/[_-]+/g, " ").trim();
+}
+
+// --- Helper: Deduplicate Matches ---
+function deduplicateMatches(matches: any[]) {
+  const uniqueMap = new Map();
+  matches.forEach((m) => {
+    const key = m.path || m.id;
+    if (!uniqueMap.has(key) || m.score > uniqueMap.get(key).score) {
+      uniqueMap.set(key, m);
+    }
+  });
+  return Array.from(uniqueMap.values());
+}
+
+// --- Tool: Search Pinecone ---
+async function fetchMatchingResumes(requirements: string) {
+  try {
+    const [embedding] = await geminiEmbed([requirements]);
+    
+    // Get more results initially to allow for deduplication
+    const search = await pineconeQuery(embedding, 10); 
+    const matches = search?.matches || [];
+
+    const mappedMatches = matches.map((m: any) => {
+      const meta = m.metadata ?? {};
+      return {
+        id: m.id,
+        name: meta.fileName || meta.name || filenameToFriendlyName(meta.path ?? m.id),
+        path: meta.path ?? "no-path",
+        excerpt: meta.summary ?? meta.text?.slice(0, 500) ?? "",
+        // Convert 0.85 -> 85 for easier AI reading
+        score: Math.round((m.score ?? 0) * 100), 
+      };
+    });
+
+    return deduplicateMatches(mappedMatches).slice(0, 5); 
+
+  } catch (err) {
+    console.error("[TOOL ERROR]", err);
+    return [];
+  }
+}
+
+// --- Main Route ---
 export async function POST(req: Request) {
   try {
-    const { message, topK = 3 } = (await req.json()) as ReqBody;
-    if (!message || typeof message !== "string") {
-      return NextResponse.json({ error: "message string required" }, { status: 400 });
+    const { message, history } = await req.json();
+
+    if (!process.env.GEMINI_API_KEY) {
+      return NextResponse.json({ error: "Missing API Key" }, { status: 500 });
     }
 
-    // 1) embed query via Gemini
-    const [queryEmb] = await geminiEmbed([message]);
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-    // 2) query pinecone for top matches
-    const pineRes = await pineconeQuery(queryEmb, topK);
-    const matches = pineRes?.matches ?? [];
-
-    // 3) build context text from matches (concise)
-    const contextFragments: string[] = [];
-    for (const m of matches) {
-      const md = m.metadata ?? {};
-      const preview = md.preview ?? md.text ?? "";
-      // limit preview length
-      contextFragments.push(`(source: ${md.path ?? md.bucket ?? "unknown"} page:${md.page ?? "?"}) ${String(preview).slice(0, 800)}`);
-    }
-    const contextText = contextFragments.join("\n\n");
-
-    // 4) build system prompt: include context but instruct assistant not to reveal it
-    const systemPrompt = [
-      {
-        role: "system",
-        content:
-          "You are a concise assistant. Use the provided relevant context to answer the user's question. Do not reveal the sources or the context to the user; produce a direct, short, helpful answer.",
-      },
-    ];
-
-    // 5) build user prompt combining user's message and the context
-    const userPrompt = `User question:\n${message}\n\nRelevant context (do NOT reveal to user):\n${contextText}\n\nAnswer concisely:`;
-
-    // 6) call Gemini generate
-    // We send a compact prompt (system + user text) to the generate endpoint
-    const fullPrompt = `${systemPrompt[0].content}\n\n${userPrompt}`;
-    const assistantText = await geminiGenerate(fullPrompt, "gemini-1.0");
-
-    // 7) return assistant answer and the raw matches (for debugging / UI)
-    return NextResponse.json({
-      ok: true,
-      answer: assistantText,
-      matches: matches.map((m: any) => ({
-        id: m.id,
-        score: m.score,
-        metadata: m.metadata,
-      })),
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.5-flash",
+      // --- UPDATED FORMATTING INSTRUCTIONS ---
+      systemInstruction: 
+        "You are a Recruiter AI. When showing results, you MUST use this exact format for each candidate:\n\n" +
+        "1. First Line: `[file_path]` **File Name**\n" +
+        "2. Second Line: Score: <score>% - <One sentence summary of skills>\n" +
+        "3. Leave an empty line between candidates.\n\n" +
+        "Example Output:\n" +
+        "`[uploads/resume.pdf]` **John Doe**\n" +
+        "Score: 85% - Extensive experience in Java and Spring Boot found in recent projects.\n\n" +
+        "Do not group them. List them one by one.",
+      tools: [
+        {
+          functionDeclarations: [
+            {
+              name: "fetch_matching_resumes",
+              description: "Finds resumes based on skills.",
+              parameters: {
+                type: SchemaType.OBJECT,
+                properties: {
+                  requirements: { type: SchemaType.STRING, description: "Job requirements." },
+                },
+                required: ["requirements"],
+              },
+            },
+          ],
+        },
+      ],
     });
+
+    const cleanHistory = (history || []).map((m: any) => ({
+      role: m.role === "user" ? "user" : "model",
+      parts: [{ text: m.content || "" }],
+    }));
+
+    const chat = model.startChat({ history: cleanHistory });
+
+    const result = await chat.sendMessage(message);
+    const response = result.response;
+    const calls = response.functionCalls();
+
+    if (calls && calls.length > 0) {
+      const call = calls[0];
+      
+      if (call.name === "fetch_matching_resumes") {
+        const args = call.args as any;
+        const matches = await fetchMatchingResumes(args.requirements || message);
+
+        // Feed results back to Gemini
+        const toolResponse = await chat.sendMessage([
+          {
+            functionResponse: {
+              name: "fetch_matching_resumes",
+              response: { content: matches },
+            },
+          },
+        ]);
+
+        const aiSummary = toolResponse.response.text();
+
+        // Data for frontend cards (optional)
+        const itemsForFrontend = matches.map((m: any) => ({
+          id: m.id,
+          name: m.name,
+          score: m.score, // Already converted to 0-100 in tool
+          path: m.path,
+          reason: m.excerpt.slice(0, 150) + "..."
+        }));
+
+        return NextResponse.json({
+          role: "model",
+          content: aiSummary, 
+          items: itemsForFrontend 
+        });
+      }
+    }
+
+    return NextResponse.json({
+      role: "model",
+      content: response.text(),
+    });
+
   } catch (err: any) {
-    console.error("chat route error:", err);
-    return NextResponse.json({ error: err?.message ?? String(err) }, { status: 500 });
+    console.error("API ERROR:", err);
+    return NextResponse.json({ error: err.message }, { status: 500 });
   }
 }
